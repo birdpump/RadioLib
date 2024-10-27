@@ -27,7 +27,6 @@ public:
 
     void init() override {
 //        stdio_init_all(); //this breaks everything if called twice
-        printf("some fucking weird debug point\n");
         spiBegin();
     }
 
