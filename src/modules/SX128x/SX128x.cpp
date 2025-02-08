@@ -327,8 +327,8 @@ int16_t SX128x::transmit(const uint8_t* data, size_t len, uint8_t addr) {
   int16_t state = standby();
   RADIOLIB_ASSERT(state);
 
-  // calculate timeout in ms (500% of expected time-on-air)
-  RadioLibTime_t timeout = (getTimeOnAir(len) * 5) / 1000;
+  // calculate timeout in ms (5ms + 500 % of expected time-on-air)
+  RadioLibTime_t timeout = 5 + (getTimeOnAir(len) * 5) / 1000;
   RADIOLIB_DEBUG_BASIC_PRINTLN("Timeout in %lu ms", timeout);
 
   // start transmission
@@ -364,7 +364,7 @@ int16_t SX128x::receive(uint8_t* data, size_t len) {
   RADIOLIB_DEBUG_BASIC_PRINTLN("Timeout in %lu ms", timeout);
 
   // start reception
-  uint32_t timeoutValue = (uint32_t)((float)timeout / 15.625);
+  uint32_t timeoutValue = (uint32_t)((float)timeout / 15.625f);
   state = startReceive(timeoutValue);
   RADIOLIB_ASSERT(state);
 
@@ -480,11 +480,12 @@ int16_t SX128x::standby(uint8_t mode, bool wakeup) {
   this->mod->setRfSwitchState(Module::MODE_IDLE);
 
   if(wakeup) {
-    // pull NSS low to wake up
-    this->mod->hal->digitalWrite(this->mod->getCs(), this->mod->hal->GpioLevelLow);
+    // send a NOP command - this pulls the NSS low to exit the sleep mode,
+    // while preventing interference with possible other SPI transactions
+    (void)this->mod->SPIwriteStream((uint16_t)RADIOLIB_SX128X_CMD_NOP, NULL, 0, false, false);
   }
 
-  uint8_t data[] = { mode };
+  const uint8_t data[] = { mode };
   return(this->mod->SPIwriteStream(RADIOLIB_SX128X_CMD_SET_STANDBY, data, 1));
 }
 
@@ -512,70 +513,6 @@ void SX128x::clearPacketSentAction() {
   this->clearDio1Action();
 }
 
-int16_t SX128x::startTransmit(const uint8_t* data, size_t len, uint8_t addr) {
-  // suppress unused variable warning
-  (void)addr;
-
-  // check packet length
-  if(len > RADIOLIB_SX128X_MAX_PACKET_LENGTH) {
-    return(RADIOLIB_ERR_PACKET_TOO_LONG);
-  }
-
-  // set packet Length
-  int16_t state = RADIOLIB_ERR_NONE;
-  uint8_t modem = getPacketType();
-  if(modem == RADIOLIB_SX128X_PACKET_TYPE_LORA) {
-    state = setPacketParamsLoRa(this->preambleLengthLoRa, this->headerType, len, this->crcLoRa, this->invertIQEnabled);
-  } else if((modem == RADIOLIB_SX128X_PACKET_TYPE_GFSK) || (modem == RADIOLIB_SX128X_PACKET_TYPE_FLRC)) {
-    state = setPacketParamsGFSK(this->preambleLengthGFSK, this->syncWordLen, this->syncWordMatch, this->crcGFSK, this->whitening, len);
-  } else if(modem == RADIOLIB_SX128X_PACKET_TYPE_BLE) {
-    state = setPacketParamsBLE(this->connectionState, this->crcBLE, this->bleTestPayload, this->whitening);
-  } else {
-    return(RADIOLIB_ERR_WRONG_MODEM);
-  }
-  RADIOLIB_ASSERT(state);
-
-  // update output power
-  state = setTxParams(this->power);
-  RADIOLIB_ASSERT(state);
-
-  // set buffer pointers
-  state = setBufferBaseAddress();
-  RADIOLIB_ASSERT(state);
-
-  // write packet to buffer
-  if(modem == RADIOLIB_SX128X_PACKET_TYPE_BLE) {
-    // first 2 bytes of BLE payload are PDU header
-    state = writeBuffer(const_cast<uint8_t*>(data), len, 2);
-    RADIOLIB_ASSERT(state);
-  } else {
-    state = writeBuffer(const_cast<uint8_t*>(data), len);
-    RADIOLIB_ASSERT(state);
-  }
-
-  // set DIO mapping
-  state = setDioIrqParams(RADIOLIB_SX128X_IRQ_TX_DONE | RADIOLIB_SX128X_IRQ_RX_TX_TIMEOUT, RADIOLIB_SX128X_IRQ_TX_DONE);
-  RADIOLIB_ASSERT(state);
-
-  // clear interrupt flags
-  state = clearIrqStatus();
-  RADIOLIB_ASSERT(state);
-
-  // set RF switch (if present)
-  this->mod->setRfSwitchState(Module::MODE_TX);
-
-  // start transmission
-  state = setTx(RADIOLIB_SX128X_TX_TIMEOUT_NONE);
-  RADIOLIB_ASSERT(state);
-
-  // wait for BUSY to go low (= PA ramp up done)
-  while(this->mod->hal->digitalRead(this->mod->getGpio())) {
-    this->mod->hal->yield();
-  }
-
-  return(state);
-}
-
 int16_t SX128x::finishTransmit() {
   // clear interrupt flags
   clearIrqStatus();
@@ -586,45 +523,6 @@ int16_t SX128x::finishTransmit() {
 
 int16_t SX128x::startReceive() {
   return(this->startReceive(RADIOLIB_SX128X_RX_TIMEOUT_INF, RADIOLIB_IRQ_RX_DEFAULT_FLAGS, RADIOLIB_IRQ_RX_DEFAULT_MASK, 0));
-}
-
-int16_t SX128x::startReceive(uint16_t timeout, RadioLibIrqFlags_t irqFlags, RadioLibIrqFlags_t irqMask, size_t len) {
-  (void)len;
-  
-  // check active modem
-  if(getPacketType() == RADIOLIB_SX128X_PACKET_TYPE_RANGING) {
-    return(RADIOLIB_ERR_WRONG_MODEM);
-  }
-
-  // set DIO mapping
-  if(timeout != RADIOLIB_SX128X_RX_TIMEOUT_INF) {
-    irqMask |= (1UL << RADIOLIB_IRQ_TIMEOUT);
-  }
-
-  int16_t state = setDioIrqParams(getIrqMapped(irqFlags), getIrqMapped(irqMask));
-  RADIOLIB_ASSERT(state);
-
-  // set buffer pointers
-  state = setBufferBaseAddress();
-  RADIOLIB_ASSERT(state);
-
-  // clear interrupt flags
-  state = clearIrqStatus();
-  RADIOLIB_ASSERT(state);
-
-  // set implicit mode and expected len if applicable
-  if((this->headerType == RADIOLIB_SX128X_LORA_HEADER_IMPLICIT) && (getPacketType() == RADIOLIB_SX128X_PACKET_TYPE_LORA)) {
-    state = setPacketParamsLoRa(this->preambleLengthLoRa, this->headerType, this->payloadLen, this->crcLoRa, this->invertIQEnabled);
-    RADIOLIB_ASSERT(state);
-  }
-
-  // set RF switch (if present)
-  this->mod->setRfSwitchState(Module::MODE_RX);
-
-  // set mode to receive
-  state = setRx(timeout);
-
-  return(state);
 }
 
 int16_t SX128x::readData(uint8_t* data, size_t len) {
@@ -740,7 +638,7 @@ int16_t SX128x::getChannelScanResult() {
 }
 
 int16_t SX128x::setFrequency(float freq) {
-  RADIOLIB_CHECK_RANGE(freq, 2400.0, 2500.0, RADIOLIB_ERR_INVALID_FREQUENCY);
+  RADIOLIB_CHECK_RANGE(freq, 2400.0f, 2500.0f, RADIOLIB_ERR_INVALID_FREQUENCY);
 
   // calculate raw value
   uint32_t frf = (freq * (uint32_t(1) << RADIOLIB_SX128X_DIV_EXPONENT)) / RADIOLIB_SX128X_CRYSTAL_FREQ;
@@ -752,21 +650,21 @@ int16_t SX128x::setBandwidth(float bw) {
   uint8_t modem = getPacketType();
   if(modem == RADIOLIB_SX128X_PACKET_TYPE_LORA) {
     // check range for LoRa
-    RADIOLIB_CHECK_RANGE(bw, 203.125, 1625.0, RADIOLIB_ERR_INVALID_BANDWIDTH);
+    RADIOLIB_CHECK_RANGE(bw, 203.125f, 1625.0f, RADIOLIB_ERR_INVALID_BANDWIDTH);
   } else if(modem == RADIOLIB_SX128X_PACKET_TYPE_RANGING) {
     // check range for ranging
-    RADIOLIB_CHECK_RANGE(bw, 406.25, 1625.0, RADIOLIB_ERR_INVALID_BANDWIDTH);
+    RADIOLIB_CHECK_RANGE(bw, 406.25f, 1625.0f, RADIOLIB_ERR_INVALID_BANDWIDTH);
   } else {
     return(RADIOLIB_ERR_WRONG_MODEM);
   }
 
-  if(fabsf(bw - 203.125) <= 0.001) {
+  if(fabsf(bw - 203.125f) <= 0.001f) {
     this->bandwidth = RADIOLIB_SX128X_LORA_BW_203_125;
-  } else if(fabsf(bw - 406.25) <= 0.001) {
+  } else if(fabsf(bw - 406.25f) <= 0.001f) {
     this->bandwidth = RADIOLIB_SX128X_LORA_BW_406_25;
-  } else if(fabsf(bw - 812.5) <= 0.001) {
+  } else if(fabsf(bw - 812.5f) <= 0.001f) {
     this->bandwidth = RADIOLIB_SX128X_LORA_BW_812_50;
-  } else if(fabsf(bw - 1625.0) <= 0.001) {
+  } else if(fabsf(bw - 1625.0f) <= 0.001f) {
     this->bandwidth = RADIOLIB_SX128X_LORA_BW_1625_00;
   } else {
     return(RADIOLIB_ERR_INVALID_BANDWIDTH);
@@ -858,10 +756,10 @@ int16_t SX128x::checkOutputPower(int8_t pwr, int8_t* clipped) {
 
 int16_t SX128x::setModem(ModemType_t modem) {
   switch(modem) {
-    case(ModemType_t::LoRa): {
+    case(ModemType_t::RADIOLIB_MODEM_LORA): {
       return(this->begin());
     } break;
-    case(ModemType_t::FSK): {
+    case(ModemType_t::RADIOLIB_MODEM_FSK): {
       return(this->beginGFSK());
     } break;
     default:
@@ -875,10 +773,10 @@ int16_t SX128x::getModem(ModemType_t* modem) {
   uint8_t packetType = getPacketType();
   switch(packetType) {
     case(RADIOLIB_SX128X_PACKET_TYPE_LORA):
-      *modem = ModemType_t::LoRa;
+      *modem = ModemType_t::RADIOLIB_MODEM_LORA;
       return(RADIOLIB_ERR_NONE);
     case(RADIOLIB_SX128X_PACKET_TYPE_GFSK):
-      *modem = ModemType_t::FSK;
+      *modem = ModemType_t::RADIOLIB_MODEM_FSK;
       return(RADIOLIB_ERR_NONE);
   }
   
@@ -1015,21 +913,21 @@ int16_t SX128x::setFrequencyDeviation(float freqDev) {
 
   // set frequency deviation to lowest available setting (required for digimodes)
   float newFreqDev = freqDev;
-  if(freqDev < 0.0) {
-    newFreqDev = 62.5;
+  if(freqDev < 0.0f) {
+    newFreqDev = 62.5f;
   }
 
-  RADIOLIB_CHECK_RANGE(newFreqDev, 62.5, 1000.0, RADIOLIB_ERR_INVALID_FREQUENCY_DEVIATION);
+  RADIOLIB_CHECK_RANGE(newFreqDev, 62.5f, 1000.0f, RADIOLIB_ERR_INVALID_FREQUENCY_DEVIATION);
 
   // override for the lowest possible frequency deviation - required for some PhysicalLayer protocols
-  if(newFreqDev == 0.0) {
+  if(newFreqDev == 0.0f) {
     this->modIndex = RADIOLIB_SX128X_BLE_GFSK_MOD_IND_0_35;
     this->bitRate = RADIOLIB_SX128X_BLE_GFSK_BR_0_125_BW_0_3;
     return(setModulationParams(this->bitRate, this->modIndex, this->shaping));
   }
 
   // update modulation parameters
-  uint8_t modInd = (uint8_t)((8.0 * (newFreqDev / (float)this->bitRateKbps)) - 1.0);
+  uint8_t modInd = (uint8_t)((8.0f * (newFreqDev / (float)this->bitRateKbps)) - 1.0f);
   if(modInd > RADIOLIB_SX128X_BLE_GFSK_MOD_IND_4_00) {
     return(RADIOLIB_ERR_INVALID_MODULATION_PARAMETERS);
   }
@@ -1124,7 +1022,7 @@ int16_t SX128x::setSyncWord(uint8_t syncWord, uint8_t controlBits) {
   }
 
   // update register
-  uint8_t data[2] = {(uint8_t)((syncWord & 0xF0) | ((controlBits & 0xF0) >> 4)), (uint8_t)(((syncWord & 0x0F) << 4) | (controlBits & 0x0F))};
+  const uint8_t data[2] = {(uint8_t)((syncWord & 0xF0) | ((controlBits & 0xF0) >> 4)), (uint8_t)(((syncWord & 0x0F) << 4) | (controlBits & 0x0F))};
   return(writeRegister(RADIOLIB_SX128X_REG_LORA_SYNC_WORD_MSB, data, 2));
 }
 
@@ -1172,7 +1070,7 @@ int16_t SX128x::setCRC(uint8_t len, uint32_t initial, uint16_t polynomial) {
     RADIOLIB_ASSERT(state);
 
     // set initial CRC value
-    uint8_t data[] = { (uint8_t)((initial >> 16) & 0xFF), (uint8_t)((initial >> 8) & 0xFF), (uint8_t)(initial & 0xFF) };
+    const uint8_t data[] = { (uint8_t)((initial >> 16) & 0xFF), (uint8_t)((initial >> 8) & 0xFF), (uint8_t)(initial & 0xFF) };
     state = writeRegister(RADIOLIB_SX128X_REG_BLE_CRC_INITIAL_MSB, data, 3);
     return(state);
 
@@ -1219,7 +1117,7 @@ int16_t SX128x::setAccessAddress(uint32_t addr) {
   }
 
   // set the address
-  uint8_t addrBuff[] = { (uint8_t)((addr >> 24) & 0xFF), (uint8_t)((addr >> 16) & 0xFF), (uint8_t)((addr >> 8) & 0xFF), (uint8_t)(addr & 0xFF) };
+  const uint8_t addrBuff[] = { (uint8_t)((addr >> 24) & 0xFF), (uint8_t)((addr >> 16) & 0xFF), (uint8_t)((addr >> 8) & 0xFF), (uint8_t)(addr & 0xFF) };
   return(SX128x::writeRegister(RADIOLIB_SX128X_REG_ACCESS_ADDRESS_BYTE_3, addrBuff, 4));
 }
 
@@ -1288,7 +1186,7 @@ float SX128x::getRSSI() {
     uint8_t rssiSync = packetStatus[0];
     float rssiMeasured = -1.0 * rssiSync/2.0;
     float snr = getSNR();
-    if(snr <= 0.0) {
+    if(snr <= 0.0f) {
       return(rssiMeasured - snr);
     } else {
       return(rssiMeasured);
@@ -1305,7 +1203,7 @@ float SX128x::getRSSI(bool packet) {
         // get instantaneous RSSI value
         uint8_t data[3] = {0, 0, 0}; // RssiInst, Status, RFU
         this->mod->SPIreadStream(RADIOLIB_SX128X_CMD_GET_RSSI_INST, data, 3);
-        return ((float)data[0] / (-2.0));
+        return ((float)data[0] / (-2.0f));
     } else {
         return this->getRSSI();
     }
@@ -1327,7 +1225,7 @@ float SX128x::getSNR() {
   if(snr < 128) {
     return(snr/4.0);
   } else {
-    return((snr - 256)/4.0);
+    return((snr - 256)/4.0f);
   }
 }
 
@@ -1356,9 +1254,9 @@ float SX128x::getFrequencyError() {
     // frequency error is negative
     efe |= (uint32_t) 0xFFF00000;
     efe = ~efe + 1;
-    error = 1.55 * (float) efe / (1600.0 / (float) this->bandwidthKhz) * -1.0;
+    error = 1.55f * (float) efe / (1600.0f / this->bandwidthKhz) * -1.0f;
   } else {
-    error = 1.55 * (float) efe / (1600.0 / (float) this->bandwidthKhz);
+    error = 1.55f * (float) efe / (1600.0f / this->bandwidthKhz);
   }
 
   return(error);
@@ -1431,7 +1329,7 @@ RadioLibTime_t SX128x::getTimeOnAir(size_t len) {
       uint32_t N_symbolPreamble = (this->preambleLengthLoRa & 0x0F) * (uint32_t(1) << ((this->preambleLengthLoRa & 0xF0) >> 4));
 
       // calculate the number of symbols
-      N_symbol = (float)N_symbolPreamble + coeff1 + 8.0 + ceilf((float)RADIOLIB_MAX((int16_t)(8 * len + N_bitCRC - coeff2 + N_symbolHeader), (int16_t)0) / (float)coeff3) * (float)(this->codingRateLoRa + 4);
+      N_symbol = (float)N_symbolPreamble + coeff1 + 8.0f + ceilf((float)RADIOLIB_MAX((int16_t)(8 * len + N_bitCRC - coeff2 + N_symbolHeader), (int16_t)0) / (float)coeff3) * (float)(this->codingRateLoRa + 4);
 
     } else {
       // long interleaving - abandon hope all ye who enter here
@@ -1440,7 +1338,7 @@ RadioLibTime_t SX128x::getTimeOnAir(size_t len) {
     }
 
     // get time-on-air in us
-    return(((uint32_t(1) << sf) / this->bandwidthKhz) * N_symbol * 1000.0);
+    return(((uint32_t(1) << sf) / this->bandwidthKhz) * N_symbol * 1000.0f);
 
   } else {
     return(((uint32_t)len * 8 * 1000) / this->bitRateKbps);
@@ -1488,6 +1386,128 @@ int16_t SX128x::invertIQ(bool enable) {
   return(setPacketParamsLoRa(this->preambleLengthLoRa, this->headerType, this->payloadLen, this->crcLoRa, this->invertIQEnabled));
 }
 
+int16_t SX128x::stageMode(RadioModeType_t mode, RadioModeConfig_t* cfg) {
+  int16_t state;
+
+  switch(mode) {
+    case(RADIOLIB_RADIO_MODE_RX): {
+      // in implicit header mode, use the provided length if it is nonzero
+      // otherwise we trust the user has previously set the payload length manually
+      if((this->headerType == RADIOLIB_SX128X_LORA_HEADER_IMPLICIT) && (cfg->receive.len != 0)) {
+        this->payloadLen = cfg->receive.len;
+      }
+      
+      // check active modem
+      if(getPacketType() == RADIOLIB_SX128X_PACKET_TYPE_RANGING) {
+        return(RADIOLIB_ERR_WRONG_MODEM);
+      }
+
+      // set DIO mapping
+      if(cfg->receive.timeout != RADIOLIB_SX128X_RX_TIMEOUT_INF) {
+        cfg->receive.irqMask |= (1UL << RADIOLIB_IRQ_TIMEOUT);
+      }
+
+      state = setDioIrqParams(getIrqMapped(cfg->receive.irqFlags), getIrqMapped(cfg->receive.irqMask));
+      RADIOLIB_ASSERT(state);
+
+      // set buffer pointers
+      state = setBufferBaseAddress();
+      RADIOLIB_ASSERT(state);
+
+      // clear interrupt flags
+      state = clearIrqStatus();
+      RADIOLIB_ASSERT(state);
+
+      // set implicit mode and expected len if applicable
+      if((this->headerType == RADIOLIB_SX128X_LORA_HEADER_IMPLICIT) && (getPacketType() == RADIOLIB_SX128X_PACKET_TYPE_LORA)) {
+        state = setPacketParamsLoRa(this->preambleLengthLoRa, this->headerType, this->payloadLen, this->crcLoRa, this->invertIQEnabled);
+        RADIOLIB_ASSERT(state);
+      }
+      this->rxTimeout = cfg->receive.timeout;
+    } break;
+  
+    case(RADIOLIB_RADIO_MODE_TX): {
+      // check packet length
+      if(cfg->transmit.len > RADIOLIB_SX128X_MAX_PACKET_LENGTH) {
+        return(RADIOLIB_ERR_PACKET_TOO_LONG);
+      }
+
+      // set packet Length
+      uint8_t modem = getPacketType();
+      if(modem == RADIOLIB_SX128X_PACKET_TYPE_LORA) {
+        state = setPacketParamsLoRa(this->preambleLengthLoRa, this->headerType, cfg->transmit.len, this->crcLoRa, this->invertIQEnabled);
+      } else if((modem == RADIOLIB_SX128X_PACKET_TYPE_GFSK) || (modem == RADIOLIB_SX128X_PACKET_TYPE_FLRC)) {
+        state = setPacketParamsGFSK(this->preambleLengthGFSK, this->syncWordLen, this->syncWordMatch, this->crcGFSK, this->whitening, cfg->transmit.len);
+      } else if(modem == RADIOLIB_SX128X_PACKET_TYPE_BLE) {
+        state = setPacketParamsBLE(this->connectionState, this->crcBLE, this->bleTestPayload, this->whitening);
+      } else {
+        return(RADIOLIB_ERR_WRONG_MODEM);
+      }
+      RADIOLIB_ASSERT(state);
+
+      // update output power
+      state = setTxParams(this->power);
+      RADIOLIB_ASSERT(state);
+
+      // set buffer pointers
+      state = setBufferBaseAddress();
+      RADIOLIB_ASSERT(state);
+
+      // write packet to buffer
+      if(modem == RADIOLIB_SX128X_PACKET_TYPE_BLE) {
+        // first 2 bytes of BLE payload are PDU header
+        state = writeBuffer(cfg->transmit.data, cfg->transmit.len, 2);
+        RADIOLIB_ASSERT(state);
+      } else {
+        state = writeBuffer(cfg->transmit.data, cfg->transmit.len);
+        RADIOLIB_ASSERT(state);
+      }
+
+      // set DIO mapping
+      state = setDioIrqParams(RADIOLIB_SX128X_IRQ_TX_DONE | RADIOLIB_SX128X_IRQ_RX_TX_TIMEOUT, RADIOLIB_SX128X_IRQ_TX_DONE);
+      RADIOLIB_ASSERT(state);
+
+      // clear interrupt flags
+      state = clearIrqStatus();
+      RADIOLIB_ASSERT(state);
+    } break;
+    
+    default:
+      return(RADIOLIB_ERR_UNSUPPORTED);
+  }
+
+  this->stagedMode = mode;
+  return(state);
+}
+
+int16_t SX128x::launchMode() {
+  int16_t state;
+  switch(this->stagedMode) {
+    case(RADIOLIB_RADIO_MODE_RX): {
+      this->mod->setRfSwitchState(Module::MODE_RX);
+      state = setRx(this->rxTimeout);
+      RADIOLIB_ASSERT(state);
+    } break;
+  
+    case(RADIOLIB_RADIO_MODE_TX): {
+      this->mod->setRfSwitchState(Module::MODE_TX);
+      state = setTx(RADIOLIB_SX128X_TX_TIMEOUT_NONE);
+      RADIOLIB_ASSERT(state);
+
+      // wait for BUSY to go low (= PA ramp up done)
+      while(this->mod->hal->digitalRead(this->mod->getGpio())) {
+        this->mod->hal->yield();
+      }
+    } break;
+    
+    default:
+      return(RADIOLIB_ERR_UNSUPPORTED);
+  }
+
+  this->stagedMode = RADIOLIB_RADIO_MODE_NONE;
+  return(state);
+}
+
 #if !RADIOLIB_EXCLUDE_DIRECT_RECEIVE
 void SX128x::setDirectAction(void (*func)(void)) {
   // SX128x is unable to perform direct mode reception
@@ -1512,7 +1532,7 @@ uint8_t SX128x::getStatus() {
   return(data);
 }
 
-int16_t SX128x::writeRegister(uint16_t addr, uint8_t* data, uint8_t numBytes) {
+int16_t SX128x::writeRegister(uint16_t addr, const uint8_t* data, uint8_t numBytes) {
   this->mod->SPIwriteRegisterBurst(addr, data, numBytes);
   return(RADIOLIB_ERR_NONE);
 }
@@ -1526,23 +1546,23 @@ int16_t SX128x::readRegister(uint16_t addr, uint8_t* data, uint8_t numBytes) {
   return(state);
 }
 
-int16_t SX128x::writeBuffer(uint8_t* data, uint8_t numBytes, uint8_t offset) {
-  uint8_t cmd[] = { RADIOLIB_SX128X_CMD_WRITE_BUFFER, offset };
+int16_t SX128x::writeBuffer(const uint8_t* data, uint8_t numBytes, uint8_t offset) {
+  const uint8_t cmd[] = { RADIOLIB_SX128X_CMD_WRITE_BUFFER, offset };
   return(this->mod->SPIwriteStream(cmd, 2, data, numBytes));
 }
 
 int16_t SX128x::readBuffer(uint8_t* data, uint8_t numBytes, uint8_t offset) {
-  uint8_t cmd[] = { RADIOLIB_SX128X_CMD_READ_BUFFER, offset };
+  const uint8_t cmd[] = { RADIOLIB_SX128X_CMD_READ_BUFFER, offset };
   return(this->mod->SPIreadStream(cmd, 2, data, numBytes));
 }
 
 int16_t SX128x::setTx(uint16_t periodBaseCount, uint8_t periodBase) {
-  uint8_t data[] = { periodBase, (uint8_t)((periodBaseCount >> 8) & 0xFF), (uint8_t)(periodBaseCount & 0xFF) };
+  const uint8_t data[] = { periodBase, (uint8_t)((periodBaseCount >> 8) & 0xFF), (uint8_t)(periodBaseCount & 0xFF) };
   return(this->mod->SPIwriteStream(RADIOLIB_SX128X_CMD_SET_TX, data, 3));
 }
 
 int16_t SX128x::setRx(uint16_t periodBaseCount, uint8_t periodBase) {
-  uint8_t data[] = { periodBase, (uint8_t)((periodBaseCount >> 8) & 0xFF), (uint8_t)(periodBaseCount & 0xFF) };
+  const uint8_t data[] = { periodBase, (uint8_t)((periodBaseCount >> 8) & 0xFF), (uint8_t)(periodBaseCount & 0xFF) };
   return(this->mod->SPIwriteStream(RADIOLIB_SX128X_CMD_SET_RX, data, 3));
 }
 
@@ -1562,42 +1582,42 @@ uint8_t SX128x::getPacketType() {
 }
 
 int16_t SX128x::setRfFrequency(uint32_t frf) {
-  uint8_t data[] = { (uint8_t)((frf >> 16) & 0xFF), (uint8_t)((frf >> 8) & 0xFF), (uint8_t)(frf & 0xFF) };
+  const uint8_t data[] = { (uint8_t)((frf >> 16) & 0xFF), (uint8_t)((frf >> 8) & 0xFF), (uint8_t)(frf & 0xFF) };
   return(this->mod->SPIwriteStream(RADIOLIB_SX128X_CMD_SET_RF_FREQUENCY, data, 3));
 }
 
 int16_t SX128x::setTxParams(uint8_t pwr, uint8_t rampTime) {
-  uint8_t data[] = { pwr, rampTime };
+  const uint8_t data[] = { pwr, rampTime };
   return(this->mod->SPIwriteStream(RADIOLIB_SX128X_CMD_SET_TX_PARAMS, data, 2));
 }
 
 int16_t SX128x::setBufferBaseAddress(uint8_t txBaseAddress, uint8_t rxBaseAddress) {
-  uint8_t data[] = { txBaseAddress, rxBaseAddress };
+  const uint8_t data[] = { txBaseAddress, rxBaseAddress };
   return(this->mod->SPIwriteStream(RADIOLIB_SX128X_CMD_SET_BUFFER_BASE_ADDRESS, data, 2));
 }
 
 int16_t SX128x::setModulationParams(uint8_t modParam1, uint8_t modParam2, uint8_t modParam3) {
-  uint8_t data[] = { modParam1, modParam2, modParam3 };
+  const uint8_t data[] = { modParam1, modParam2, modParam3 };
   return(this->mod->SPIwriteStream(RADIOLIB_SX128X_CMD_SET_MODULATION_PARAMS, data, 3));
 }
 
 int16_t SX128x::setPacketParamsGFSK(uint8_t preambleLen, uint8_t syncLen, uint8_t syncMatch, uint8_t crcLen, uint8_t whiten, uint8_t payLen, uint8_t hdrType) {
-  uint8_t data[] = { preambleLen, syncLen, syncMatch, hdrType, payLen, crcLen, whiten };
+  const uint8_t data[] = { preambleLen, syncLen, syncMatch, hdrType, payLen, crcLen, whiten };
   return(this->mod->SPIwriteStream(RADIOLIB_SX128X_CMD_SET_PACKET_PARAMS, data, 7));
 }
 
 int16_t SX128x::setPacketParamsBLE(uint8_t connState, uint8_t crcLen, uint8_t bleTest, uint8_t whiten) {
-  uint8_t data[] = { connState, crcLen, bleTest, whiten, 0x00, 0x00, 0x00 };
+  const uint8_t data[] = { connState, crcLen, bleTest, whiten, 0x00, 0x00, 0x00 };
   return(this->mod->SPIwriteStream(RADIOLIB_SX128X_CMD_SET_PACKET_PARAMS, data, 7));
 }
 
 int16_t SX128x::setPacketParamsLoRa(uint8_t preambleLen, uint8_t hdrType, uint8_t payLen, uint8_t crc, uint8_t invIQ) {
-  uint8_t data[] = { preambleLen, hdrType, payLen, crc, invIQ, 0x00, 0x00 };
+  const uint8_t data[] = { preambleLen, hdrType, payLen, crc, invIQ, 0x00, 0x00 };
   return(this->mod->SPIwriteStream(RADIOLIB_SX128X_CMD_SET_PACKET_PARAMS, data, 7));
 }
 
 int16_t SX128x::setDioIrqParams(uint16_t irqMask, uint16_t dio1Mask, uint16_t dio2Mask, uint16_t dio3Mask) {
-  uint8_t data[] = { (uint8_t)((irqMask >> 8) & 0xFF), (uint8_t)(irqMask & 0xFF),
+  const uint8_t data[] = { (uint8_t)((irqMask >> 8) & 0xFF), (uint8_t)(irqMask & 0xFF),
                      (uint8_t)((dio1Mask >> 8) & 0xFF), (uint8_t)(dio1Mask & 0xFF),
                      (uint8_t)((dio2Mask >> 8) & 0xFF), (uint8_t)(dio2Mask & 0xFF),
                      (uint8_t)((dio3Mask >> 8) & 0xFF), (uint8_t)(dio3Mask & 0xFF) };
@@ -1611,17 +1631,17 @@ uint16_t SX128x::getIrqStatus() {
 }
 
 int16_t SX128x::clearIrqStatus(uint16_t clearIrqParams) {
-  uint8_t data[] = { (uint8_t)((clearIrqParams >> 8) & 0xFF), (uint8_t)(clearIrqParams & 0xFF) };
+  const uint8_t data[] = { (uint8_t)((clearIrqParams >> 8) & 0xFF), (uint8_t)(clearIrqParams & 0xFF) };
   return(this->mod->SPIwriteStream(RADIOLIB_SX128X_CMD_CLEAR_IRQ_STATUS, data, 2));
 }
 
 int16_t SX128x::setRangingRole(uint8_t role) {
-  uint8_t data[] = { role };
+  const uint8_t data[] = { role };
   return(this->mod->SPIwriteStream(RADIOLIB_SX128X_CMD_SET_RANGING_ROLE, data, 1));
 }
 
 int16_t SX128x::setPacketType(uint8_t type) {
-  uint8_t data[] = { type };
+  const uint8_t data[] = { type };
   return(this->mod->SPIwriteStream(RADIOLIB_SX128X_CMD_SET_PACKET_TYPE, data, 1));
 }
 

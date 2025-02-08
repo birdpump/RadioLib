@@ -387,7 +387,7 @@ int16_t nRF24::setAddressWidth(uint8_t addrWidth) {
   return(state);
 }
 
-int16_t nRF24::setTransmitPipe(uint8_t* addr) {
+int16_t nRF24::setTransmitPipe(const uint8_t* addr) {
   // set mode to standby
   int16_t state = standby();
   RADIOLIB_ASSERT(state);
@@ -402,7 +402,7 @@ int16_t nRF24::setTransmitPipe(uint8_t* addr) {
   return(state);
 }
 
-int16_t nRF24::setReceivePipe(uint8_t pipeNum, uint8_t* addr) {
+int16_t nRF24::setReceivePipe(uint8_t pipeNum, const uint8_t* addr) {
   // set mode to standby
   int16_t state = standby();
   RADIOLIB_ASSERT(state);
@@ -610,48 +610,12 @@ void nRF24::SPIreadRxPayload(uint8_t* data, uint8_t numBytes) {
   SPItransfer(RADIOLIB_NRF24_CMD_READ_RX_PAYLOAD, false, NULL, data, numBytes);
 }
 
-void nRF24::SPIwriteTxPayload(uint8_t* data, uint8_t numBytes) {
+void nRF24::SPIwriteTxPayload(const uint8_t* data, uint8_t numBytes) {
   SPItransfer(RADIOLIB_NRF24_CMD_WRITE_TX_PAYLOAD, true, data, NULL, numBytes);
 }
 
-void nRF24::SPItransfer(uint8_t cmd, bool write, uint8_t* dataOut, uint8_t* dataIn, uint8_t numBytes) {
-  // prepare the buffers
-  size_t buffLen = 1 + numBytes;
-  #if RADIOLIB_STATIC_ONLY
-    uint8_t buffOut[RADIOLIB_STATIC_ARRAY_SIZE];
-    uint8_t buffIn[RADIOLIB_STATIC_ARRAY_SIZE];
-  #else
-    uint8_t* buffOut = new uint8_t[buffLen];
-    uint8_t* buffIn = new uint8_t[buffLen];
-  #endif
-  uint8_t* buffOutPtr = buffOut;
-
-  // copy the command
-  *(buffOutPtr++) = cmd;
-
-  // copy the data
-  if(write) {
-    memcpy(buffOutPtr, dataOut, numBytes);
-  } else {
-    memset(buffOutPtr, 0x00, numBytes);
-  }
-
-  // do the transfer
-  this->mod->hal->digitalWrite(this->mod->getCs(), this->mod->hal->GpioLevelLow);
-  this->mod->hal->spiBeginTransaction();
-  this->mod->hal->spiTransfer(buffOut, buffLen, buffIn);
-  this->mod->hal->spiEndTransaction();
-  this->mod->hal->digitalWrite(this->mod->getCs(), this->mod->hal->GpioLevelHigh);
-  
-  // copy the data
-  if(!write) {
-    memcpy(dataIn, &buffIn[1], numBytes);
-  }
-
-  #if !RADIOLIB_STATIC_ONLY
-    delete[] buffOut;
-    delete[] buffIn;
-  #endif
+void nRF24::SPItransfer(uint8_t cmd, bool write, const uint8_t* dataOut, uint8_t* dataIn, uint8_t numBytes) {
+  (void)this->mod->SPItransferStream(&cmd, 1, write, dataOut, dataIn, numBytes, false);
 }
 
 #endif

@@ -48,6 +48,9 @@ void setup() {
   // Override the default join rate
   uint8_t joinDR = 4;
 
+  // Optionally provide a custom sleep function - see config.h
+  //node.setSleepFunction(customDelay);
+
   // Setup the OTAA session information
   node.beginOTAA(joinEUI, devEUI, nwkKey, appKey);
 
@@ -68,7 +71,7 @@ void setup() {
   // Manages uplink intervals to the TTN Fair Use Policy
   node.setDutyCycle(true, 1250);
 
-  // Enable the dwell time limits - 400ms is the limit for the US
+  // Update dwell time limits - 400ms is the limit for the US
   node.setDwellTime(true, 400);
 
   Serial.println(F("Ready!\n"));

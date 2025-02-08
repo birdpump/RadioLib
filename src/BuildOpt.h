@@ -29,7 +29,11 @@
 // set which output port should be used for debug output
 // may be Serial port (on Arduino) or file like stdout or stderr (on generic platforms)
 #if !defined(RADIOLIB_DEBUG_PORT)
-  #define RADIOLIB_DEBUG_PORT   Serial
+  #if ARDUINO >= 100
+    #define RADIOLIB_DEBUG_PORT   Serial
+  #else
+    #define RADIOLIB_DEBUG_PORT   stdout
+  #endif
 #endif
 
 /*
@@ -129,14 +133,12 @@
  * Platform-specific configuration.
  *
  * RADIOLIB_PLATFORM - platform name, used in debugging to quickly check the correct platform is detected.
- * RADIOLIB_NC - alias for unused pin, usually the largest possible value of uint8_t.
+ * RADIOLIB_NC - alias for unused pin, usually the largest possible value of uint32_t.
  * RADIOLIB_DEFAULT_SPI - default SPIClass instance to use.
  * RADIOLIB_NONVOLATILE - macro to place variable into program storage (usually Flash).
  * RADIOLIB_NONVOLATILE_READ_BYTE - function/macro to read variables saved in program storage (usually Flash).
- * RADIOLIB_TYPE_ALIAS - construct to create an alias for a type, usually vai the `using` keyword.
+ * RADIOLIB_TYPE_ALIAS - construct to create an alias for a type, usually via the `using` keyword.
  * RADIOLIB_TONE_UNSUPPORTED - some platforms do not have tone()/noTone(), which is required for AFSK.
- *
- * In addition, some platforms may require RadioLib to disable specific drivers (such as ESP8266).
  *
  * Users may also specify their own configuration by uncommenting the RADIOLIB_CUSTOM_ARDUINO,
  * and then specifying all platform parameters in the section below. This will override automatic
@@ -262,20 +264,24 @@
   #define RADIOLIB_ARDUINOHAL_PIN_STATUS_CAST         (PinStatus)
   #define RADIOLIB_ARDUINOHAL_INTERRUPT_MODE_CAST     (PinStatus)
 
+  #if defined(ARDUINO_ARCH_MBED)
   // Arduino mbed OS boards have a really bad tone implementation which will crash after a couple seconds
   #define RADIOLIB_TONE_UNSUPPORTED
   #define RADIOLIB_MBED_TONE_OVERRIDE
+  #endif
 
-#elif defined(ARDUINO_PORTENTA_H7_M7) || defined(ARDUINO_PORTENTA_H7_M4)
+#elif defined(ARDUINO_PORTENTA_H7_M7) || defined(ARDUINO_PORTENTA_H7_M4) || defined(ARDUINO_PORTENTA_H7)
   // Arduino Portenta H7
   #define RADIOLIB_PLATFORM                           "Portenta H7"
   #define RADIOLIB_ARDUINOHAL_PIN_MODE_CAST           (PinMode)
   #define RADIOLIB_ARDUINOHAL_PIN_STATUS_CAST         (PinStatus)
   #define RADIOLIB_ARDUINOHAL_INTERRUPT_MODE_CAST     (PinStatus)
 
+  #if defined(ARDUINO_ARCH_MBED)
   // Arduino mbed OS boards have a really bad tone implementation which will crash after a couple seconds
   #define RADIOLIB_TONE_UNSUPPORTED
   #define RADIOLIB_MBED_TONE_OVERRIDE
+  #endif
 
 #elif defined(__STM32F4__) || defined(__STM32F1__)
   // Arduino STM32 core by Roger Clark (https://github.com/rogerclarkmelbourne/Arduino_STM32)
@@ -365,6 +371,13 @@
   #define RADIOLIB_ARDUINOHAL_PIN_STATUS_CAST         (PinStatus)
   #define RADIOLIB_ARDUINOHAL_INTERRUPT_MODE_CAST     (PinStatus)
 
+#elif defined(ARDUINO_ARCH_SILABS)
+  // Silicon Labs Arduino
+  #define RADIOLIB_PLATFORM                           "Arduino Silicon Labs"
+  #define RADIOLIB_ARDUINOHAL_PIN_MODE_CAST           (PinMode)
+  #define RADIOLIB_ARDUINOHAL_PIN_STATUS_CAST         (PinStatus)
+  #define RADIOLIB_ARDUINOHAL_INTERRUPT_MODE_CAST     (PinStatus)
+
 #else
   // other Arduino platforms not covered by the above list - this may or may not work
   #define RADIOLIB_PLATFORM                           "Unknown Arduino"
@@ -422,15 +435,11 @@
   // generic non-Arduino platform
   #define RADIOLIB_PLATFORM                           "Generic"
 
-  #define RADIOLIB_NC                                 (0xFF)
+  #define RADIOLIB_NC                                 (0xFFFFFFFF)
   #define RADIOLIB_NONVOLATILE
-  #define RADIOLIB_NONVOLATILE_READ_BYTE(addr)        (*((uint8_t *)(void *)(addr)))
-  #define RADIOLIB_NONVOLATILE_READ_DWORD(addr)       (*((uint32_t *)(void *)(addr)))
+  #define RADIOLIB_NONVOLATILE_READ_BYTE(addr)        (*(reinterpret_cast<uint8_t *>(reinterpret_cast<void *>(addr))))
+  #define RADIOLIB_NONVOLATILE_READ_DWORD(addr)       (*(reinterpret_cast<uint32_t *>(reinterpret_cast<void *>(addr))))
   #define RADIOLIB_TYPE_ALIAS(type, alias)            using alias = type;
-
-  #if !defined(RADIOLIB_DEBUG_PORT)
-    #define RADIOLIB_DEBUG_PORT                       stdout
-  #endif
 
   #define DEC 10
   #define HEX 16
@@ -504,11 +513,13 @@
 
 #if RADIOLIB_DEBUG_PROTOCOL
   #define RADIOLIB_DEBUG_PROTOCOL_PRINT(...) RADIOLIB_DEBUG_PRINT_LVL("RLB_PRO: ", __VA_ARGS__)
+  #define RADIOLIB_DEBUG_PROTOCOL_PRINT_NOTAG(...) RADIOLIB_DEBUG_PRINT_LVL("", __VA_ARGS__)
   #define RADIOLIB_DEBUG_PROTOCOL_PRINTLN(...) RADIOLIB_DEBUG_PRINTLN_LVL("RLB_PRO: ", __VA_ARGS__)
   #define RADIOLIB_DEBUG_PROTOCOL_PRINT_FLOAT(...) RADIOLIB_DEBUG_PRINT_FLOAT("RLB_PRO: ", __VA_ARGS__);
   #define RADIOLIB_DEBUG_PROTOCOL_HEXDUMP(...) RADIOLIB_DEBUG_HEXDUMP("RLB_PRO: ", __VA_ARGS__);
 #else
   #define RADIOLIB_DEBUG_PROTOCOL_PRINT(...) {}
+  #define RADIOLIB_DEBUG_PROTOCOL_PRINT_NOTAG(...) {}
   #define RADIOLIB_DEBUG_PROTOCOL_PRINTLN(...) {}
   #define RADIOLIB_DEBUG_PROTOCOL_PRINT_FLOAT(...) {}
   #define RADIOLIB_DEBUG_PROTOCOL_HEXDUMP(...) {}
@@ -577,7 +588,7 @@
 
 // version definitions
 #define RADIOLIB_VERSION_MAJOR  7
-#define RADIOLIB_VERSION_MINOR  0
+#define RADIOLIB_VERSION_MINOR  1
 #define RADIOLIB_VERSION_PATCH  2
 #define RADIOLIB_VERSION_EXTRA  0
 
